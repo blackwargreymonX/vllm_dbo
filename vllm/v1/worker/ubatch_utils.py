@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import TypeAlias
 
@@ -36,14 +37,44 @@ def is_last_ubatch_empty(
 
 
 def check_ubatch_thresholds(
-    config: ParallelConfig, num_tokens: int, uniform_decode: bool
+    config: ParallelConfig,
+    num_tokens: int,
+    uniform_decode: bool,
+    max_prompt_len: int = 0,
+    num_reqs: int = 0,
 ) -> bool:
+    """Decide whether to enable DBO ubatching for this batch.
+
+    For prefill, additionally gate on per-request length (max_prompt_len) and
+    request count (num_reqs):
+    - num_reqs<2 (bs=1) goes through the mid-request split path which does
+      not benefit from DBO and tends to regress 50-100%.
+    - max_prompt_len < threshold means the cell is too small for DBO setup
+      overhead to amortize.
+
+    Threshold defaults / env overrides:
+        VLLM_DBO_PREFILL_MIN_PL: int, default 2048. Min max_prompt_len for
+            prefill DBO to fire. Set 0 to disable the gate.
+        VLLM_DBO_MIN_REQS: int, default 2. Min num_reqs in batch for DBO to
+            fire. Set 0 to disable the gate.
+    """
     if not config.use_ubatching:
         return False
     if uniform_decode:
         return num_tokens >= config.dbo_decode_token_threshold
-    else:
-        return num_tokens >= config.dbo_prefill_token_threshold
+    # Keep prefill DBO behind an explicit env switch for backward
+    # compatibility with earlier TBO experiments.
+    if os.getenv("VLLM_EXPERIMENTAL_PREFILL_DBO", "0") != "1":
+        return False
+    # Gate bs<2 (mid-request split path doesn't benefit from DBO).
+    min_reqs = int(os.getenv("VLLM_DBO_MIN_REQS", "2"))
+    if min_reqs > 0 and num_reqs > 0 and num_reqs < min_reqs:
+        return False
+    # Gate per-request length: setup overhead dominates on short prompts.
+    pl_threshold = int(os.getenv("VLLM_DBO_PREFILL_MIN_PL", "2048"))
+    if pl_threshold > 0 and max_prompt_len > 0 and max_prompt_len < pl_threshold:
+        return False
+    return num_tokens >= config.dbo_prefill_token_threshold
 
 
 # This pads the last ubatch slice out to the total number of tokens
@@ -60,6 +91,83 @@ def _pad_out_ubatch_slices(
     ]
 
 
+def _is_uniform_ubatch(num_scheduled_tokens: np.ndarray) -> bool:
+    return (
+        len(num_scheduled_tokens) > 0
+        and int(num_scheduled_tokens[0]) > 0
+        and bool(np.all(num_scheduled_tokens == num_scheduled_tokens[0]))
+    )
+
+
+def _get_uniform_request_split_points(
+    cu_num_tokens: np.ndarray,
+    num_tokens_padded: int,
+    num_ubatches: int,
+) -> list[int]:
+    """Choose split points that balance both padded tokens and real requests.
+
+    Decode DBO often pads the global token count up to a cudagraph/DP-friendly
+    size. Splitting only at ``num_tokens_padded / num_ubatches`` balances the
+    padded compute shape but can leave the real requests wildly imbalanced
+    (e.g. 33 real decodes padded to 64 becomes 32/1). For uniform decode-like
+    batches every request has the same token count, so we can restrict split
+    points to request boundaries and pick the boundary that minimizes the worst
+    normalized deviation from both the padded-token target and request target.
+    """
+    num_reqs = len(cu_num_tokens) - 1
+    split_points: list[int] = []
+    prev_req_idx = 0
+
+    for split_idx in range(1, num_ubatches):
+        remaining_splits = num_ubatches - split_idx
+        min_req_idx = prev_req_idx + 1
+        max_req_idx = num_reqs - remaining_splits
+        if min_req_idx > max_req_idx:
+            break
+
+        target_tokens = num_tokens_padded * split_idx / num_ubatches
+        target_reqs = num_reqs * split_idx / num_ubatches
+
+        best_req_idx = min_req_idx
+        best_score = (float("inf"), float("inf"), float("inf"))
+        for req_idx in range(min_req_idx, max_req_idx + 1):
+            token_boundary = int(cu_num_tokens[req_idx])
+            token_score = abs(token_boundary - target_tokens) / max(
+                num_tokens_padded, 1
+            )
+            request_score = abs(req_idx - target_reqs) / max(num_reqs, 1)
+            score = (
+                max(token_score, request_score),
+                token_score + request_score,
+                token_score,
+            )
+            if score < best_score:
+                best_score = score
+                best_req_idx = req_idx
+
+        split_points.append(int(cu_num_tokens[best_req_idx]))
+        prev_req_idx = best_req_idx
+
+    return split_points
+
+
+def _get_token_split_points(
+    num_tokens_padded: int,
+    num_ubatches: int,
+    split_point: list[int] | int | None = None,
+) -> list[int]:
+    if split_point is None:
+        return [
+            int(num_tokens_padded) * i // num_ubatches
+            for i in range(1, num_ubatches)
+        ]
+
+    if isinstance(split_point, int):
+        return [split_point * i for i in range(1, num_ubatches)]
+
+    return split_point
+
+
 def maybe_create_ubatch_slices(
     should_ubatch: bool,
     num_scheduled_tokens: np.ndarray,
@@ -71,21 +179,30 @@ def maybe_create_ubatch_slices(
     if not should_ubatch:
         return None, None
 
-    if split_point is None:
-        split_point = int(num_tokens_padded) // num_ubatches
-
-    token_split_points = [split_point * i for i in range(1, num_ubatches)]
-
     # TODO(lucas): Refactor the gpu_model_runner.py so we can pass
     # in cu_num_tokens directly (i.e. query_start_loc)
     cu_num_tokens = np.zeros(len(num_scheduled_tokens) + 1, dtype=np.int32)
     np.cumsum(num_scheduled_tokens, dtype=np.int32, out=cu_num_tokens[1:])
+    num_tokens = int(cu_num_tokens[-1])
+
+    if (
+        split_point is None
+        and len(num_scheduled_tokens) >= num_ubatches
+        and _is_uniform_ubatch(num_scheduled_tokens)
+    ):
+        token_split_points = _get_uniform_request_split_points(
+            cu_num_tokens, num_tokens_padded, num_ubatches
+        )
+    else:
+        token_split_points = _get_token_split_points(
+            num_tokens_padded, num_ubatches, split_point
+        )
 
     ubatch_slices = []
     start_token = 0
 
     # Add the end point to the split points to make iteration easier
-    all_points = token_split_points + [cu_num_tokens[-1]]
+    all_points = token_split_points + [num_tokens]
 
     for end_token in all_points:
         token_slice = slice(start_token, end_token)

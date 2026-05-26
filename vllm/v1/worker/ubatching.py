@@ -43,8 +43,12 @@ class UBatchContext:
         self.cpu_wait_event = cpu_wait_event
         self.cpu_signal_event = cpu_signal_event
         self.current_stream = compute_stream
-        self.gpu_comm_done_event = gpu_comm_done_event
-        self.gpu_compute_done_event = gpu_compute_done_event
+        # Backward-compatible default events.
+        self._default_gpu_comm_done_event = gpu_comm_done_event
+        self._default_gpu_compute_done_event = gpu_compute_done_event
+        # Per-schedule event maps created lazily on first use.
+        self._gpu_comm_done_events: dict[str, torch.Event] = {}
+        self._gpu_compute_done_events: dict[str, torch.Event] = {}
         self.schedule = schedule
         self.recv_hook = None
 
@@ -79,17 +83,35 @@ class UBatchContext:
         if current_stream() != self.current_stream:
             torch.cuda.set_stream(self.current_stream)
 
-    def _signal_comm_done(self):
-        self.gpu_comm_done_event.record(self.comm_stream)
+    def _get_compute_event(self, schedule: str) -> torch.Event:
+        if schedule == "default":
+            return self._default_gpu_compute_done_event
+        evt = self._gpu_compute_done_events.get(schedule)
+        if evt is None:
+            evt = torch.Event()
+            self._gpu_compute_done_events[schedule] = evt
+        return evt
 
-    def _signal_compute_done(self):
-        self.gpu_compute_done_event.record(self.compute_stream)
+    def _get_comm_event(self, schedule: str) -> torch.Event:
+        if schedule == "default":
+            return self._default_gpu_comm_done_event
+        evt = self._gpu_comm_done_events.get(schedule)
+        if evt is None:
+            evt = torch.Event()
+            self._gpu_comm_done_events[schedule] = evt
+        return evt
 
-    def _wait_compute_done(self):
-        self.comm_stream.wait_event(self.gpu_compute_done_event)
+    def _signal_comm_done(self, schedule: str = "default"):
+        self._get_comm_event(schedule).record(self.comm_stream)
 
-    def _wait_comm_done(self):
-        self.compute_stream.wait_event(self.gpu_comm_done_event)
+    def _signal_compute_done(self, schedule: str = "default"):
+        self._get_compute_event(schedule).record(self.compute_stream)
+
+    def _wait_compute_done(self, schedule: str = "default"):
+        self.comm_stream.wait_event(self._get_compute_event(schedule))
+
+    def _wait_comm_done(self, schedule: str = "default"):
+        self.compute_stream.wait_event(self._get_comm_event(schedule))
 
     def _cpu_yield(self):
         # It is critical for correctness that only one thread is running
@@ -100,7 +122,22 @@ class UBatchContext:
         assert not self.cpu_wait_event.is_set()
 
         self.cpu_signal_event.set()
-        self.cpu_wait_event.wait()
+        # Optional short busy-spin before falling back to a blocking wait.
+        # Avoids the futex round-trip when the other thread is about to set
+        # the event (~1-3 µs/yield × ~72 yields/forward = ~150-200 µs of CPU
+        # overhead saved on an active DBO step). Default is the original
+        # blocking wait.
+        import os as _os
+        if _os.getenv("VLLM_DBO_SPIN_YIELD", "0") == "1":
+            spin_iters = int(_os.getenv("VLLM_DBO_SPIN_ITERS", "200"))
+            ev = self.cpu_wait_event
+            for _ in range(spin_iters):
+                if ev.is_set():
+                    break
+            else:
+                ev.wait()
+        else:
+            self.cpu_wait_event.wait()
         self.cpu_wait_event.clear()
         self._restore_context()
 
@@ -111,14 +148,14 @@ class UBatchContext:
         self.update_stream(self.compute_stream)
 
     def switch_to_comm_sync(self):
-        self._signal_compute_done()
+        self._signal_compute_done("default")
         self.update_stream(self.comm_stream)
-        self._wait_compute_done()
+        self._wait_compute_done("default")
 
     def switch_to_compute_sync(self):
-        self._signal_comm_done()
+        self._signal_comm_done("default")
         self.update_stream(self.compute_stream)
-        self._wait_comm_done()
+        self._wait_comm_done("default")
 
     def maybe_run_recv_hook(self):
         if self.recv_hook is not None:
@@ -130,25 +167,44 @@ class UBatchContext:
         self._cpu_yield()
         self.update_stream(self.current_stream)
 
-    def yield_and_switch_from_compute_to_comm(self):
+    def yield_and_switch_from_compute_to_comm(self, schedule: str = "default"):
         assert current_stream() == self.compute_stream
-        self._signal_compute_done()
+        self._signal_compute_done(schedule)
         self._cpu_yield()
         assert self.current_stream == self.compute_stream
         self.update_stream(self.comm_stream)
-        self._wait_compute_done()
+        self._wait_compute_done(schedule)
 
-    def yield_and_switch_from_comm_to_compute(self):
+    def yield_and_switch_from_comm_to_compute(self, schedule: str = "default"):
         assert current_stream() == self.comm_stream
-        self._signal_comm_done()
+        self._signal_comm_done(schedule)
         self._cpu_yield()
         assert self.current_stream == self.comm_stream
         self.update_stream(self.compute_stream)
-        self._wait_comm_done()
+        self._wait_comm_done(schedule)
 
 
 def dbo_enabled() -> bool:
     return len(_THREAD_ID_TO_CONTEXT) > 0
+
+
+def is_ubatching_globally_enabled() -> bool:
+    """Fast-path query used by communication wrappers.
+
+    Avoids calling threading.get_ident() so it is safe in compiled paths.
+    """
+    return len(_THREAD_ID_TO_CONTEXT) > 0
+
+
+def get_current_ubatch_context() -> "UBatchContext | None":
+    """Return current thread's ubatch context, or None if unavailable."""
+    if len(_THREAD_ID_TO_CONTEXT) == 0:
+        return None
+    try:
+        ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
+    except Exception:
+        return None
+    return _CURRENT_CONTEXTS[ctx_idx]
 
 
 def dbo_current_ubatch_id() -> int:
@@ -160,9 +216,14 @@ def dbo_current_ubatch_id() -> int:
 def _register_ubatch_function(func):
     def wrapper(*args, **kwargs):
         if len(_THREAD_ID_TO_CONTEXT) > 0:
-            ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
-            ctx = _CURRENT_CONTEXTS[ctx_idx]
-            func(ctx, *args, **kwargs)
+            try:
+                ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
+                ctx = _CURRENT_CONTEXTS[ctx_idx]
+                if ctx is not None:
+                    func(ctx, *args, **kwargs)
+            except Exception:
+                # TorchDynamo / compile paths may reject thread-id ops.
+                return None
 
     return wrapper
 
@@ -181,6 +242,14 @@ dbo_switch_to_comm_sync = _register_ubatch_function(UBatchContext.switch_to_comm
 dbo_switch_to_compute_sync = _register_ubatch_function(
     UBatchContext.switch_to_compute_sync
 )
+
+
+def yield_and_switch_from_compute_to_comm(schedule: str = "default"):
+    dbo_yield_and_switch_from_compute_to_comm(schedule=schedule)
+
+
+def yield_and_switch_from_comm_to_compute(schedule: str = "default"):
+    dbo_yield_and_switch_from_comm_to_compute(schedule=schedule)
 
 
 def dbo_register_recv_hook(recv_hook):
