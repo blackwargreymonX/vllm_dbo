@@ -2184,7 +2184,6 @@ class GPUModelRunner(
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
-            positions=self.positions[:num_tokens_padded],
         )
 
         if self.dcp_world_size > 1:
@@ -2228,7 +2227,10 @@ class GPUModelRunner(
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
-            cache_key = (kv_cache_spec, type(builder))
+            # Include ubid in cache_key so the two ubatches do not share the
+            # same FlashAttentionMetadata object (avoids data races when one
+            # ubatch's update_block_table mutates state used by the other).
+            cache_key = (kv_cache_spec, type(builder), ubid)
 
             cascade_attn_prefix_len = (
                 cascade_attn_prefix_lens[kv_cache_gid][attn_gid]
@@ -3619,10 +3621,11 @@ class GPUModelRunner(
                 "a multiple of tensor parallel size"
             )
 
-        # Extra coordination when running data-parallel since we need to coordinate
-        # across ranks
+        # Extra coordination across DP ranks. We also enter this for DP=1
+        # so the local A1/② gates can fire (coordinate_batch_across_dp
+        # short-circuits cross-rank ops when DP=1).
         should_ubatch, num_tokens_across_dp = False, None
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+        if self.vllm_config.parallel_config.num_ubatches > 1:
             should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
                 coordinate_batch_across_dp(
                     num_tokens_unpadded=num_tokens,
@@ -3631,6 +3634,7 @@ class GPUModelRunner(
                     num_tokens_padded=num_tokens_padded,
                     uniform_decode=uniform_decode,
                     cudagraph_mode=cudagraph_mode.value,
+                    num_scheduled_tokens_per_request=num_scheduled_tokens_np,
                 )
             )
 
@@ -4671,16 +4675,6 @@ class GPUModelRunner(
                 self._copy_valid_sampled_token_count(
                     next_token_ids, valid_sampled_tokens_count
                 )
-
-            # Let the target override the hidden state fed to the drafter
-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). Safe to
-            # rebind here: hidden_states was already consumed for sampling
-            # above and is not used again in this branch.
-            alt = getattr(
-                self.get_model(), "get_mtp_target_hidden_states", lambda: None
-            )()
-            if alt is not None:
-                hidden_states = alt
 
             num_rejected_tokens_gpu = None
             if spec_decode_metadata is None:
@@ -6598,15 +6592,9 @@ class GPUModelRunner(
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
-                    # For MLA with compression, storage_block_size != block_size
-                    if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        shape_block_size = kv_cache_spec.storage_block_size
-                    else:
-                        shape_block_size = kernel_block_size
-
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
-                        shape_block_size,
+                        kernel_block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
                         cache_dtype_str=self.cache_config.cache_dtype,
@@ -6630,31 +6618,12 @@ class GPUModelRunner(
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
-
-                    raw_tensor = kv_cache_raw_tensors[layer_name].view(dtype)
-                    if kv_cache_spec.page_size_padded is not None:
-                        # Use strided view to handle page_size_bytes that
-                        # include padding. This follows
-                        # the same pattern as MambaSpec handling below.
-                        # NOTE: This assumes kv_cache_shape[0] == num_blocks
-                        # (i.e. the first physical dimension is the block
-                        # index), which holds for MLA backends but NOT for
-                        # standard attention backends whose shape starts with
-                        # a K/V dimension of size 2.
-                        dtype_size = get_dtype_size(dtype)
-                        page_stride = kv_cache_spec.page_size_bytes // dtype_size
-                        strides = list(torch.empty(kv_cache_shape).stride())
-                        strides[inv_order[0]] = page_stride
-                        kv_cache = torch.as_strided(
-                            raw_tensor,
-                            size=kv_cache_shape,
-                            stride=tuple(strides),
-                        )
-                    else:
-                        # No padding — safe to use a contiguous view.
-                        kv_cache = raw_tensor.view(kv_cache_shape)
-                    kv_caches[layer_name] = kv_cache.permute(*inv_order)
-
+                    kv_caches[layer_name] = (
+                        kv_cache_raw_tensors[layer_name]
+                        .view(dtype)
+                        .view(kv_cache_shape)
+                        .permute(*inv_order)
+                    )
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
