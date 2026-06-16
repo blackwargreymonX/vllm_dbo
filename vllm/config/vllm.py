@@ -1101,20 +1101,26 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
-        # DeepSeek V4's model classes don't carry @support_torch_compile —
+        # For model classes don't carry @support_torch_compile —
         # the breakable cudagraph is the supported PIECEWISE path. Auto-enable
         # it unless the user has explicitly opted out via the env var.
         if (
             self.model_config is not None
             and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
             and any(
-                a in ("DeepseekV4ForCausalLM", "DeepSeekV4MTPModel")
+                a
+                in (
+                    "DeepseekV4ForCausalLM",
+                    "DeepSeekV4MTPModel",
+                    "MiniMaxM3SparseForCausalLM",
+                    "MiniMaxM3SparseForConditionalGeneration",
+                )
                 for a in self.model_config.architectures
             )
         ):
             os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
             logger.info_once(
-                "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1 for DeepSeek V4. "
+                "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. "
                 "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
             )
 
@@ -1447,17 +1453,23 @@ class VllmConfig:
             )
 
         if self.parallel_config.use_ubatching:
-            # deepep_* backends are only required when EP is active.
+            # deepep_* and nixl_ep backends are only required when EP is active.
             if self.parallel_config.enable_expert_parallel:
                 a2a_backend = self.parallel_config.all2all_backend
-                assert a2a_backend in [
+                if a2a_backend not in [
                     "deepep_low_latency",
                     "deepep_high_throughput",
-                ], (
-                    "Microbatching with EP requires --all2all-backend="
-                    "deepep_low_latency or deepep_high_throughput; "
-                    f"got {a2a_backend}."
-                )
+                    "nixl_ep",
+                ]:
+                    raise ValueError(
+                        "Microbatching with EP requires --all2all-backend="
+                        "deepep_low_latency, deepep_high_throughput, or nixl_ep; "
+                        f"got {a2a_backend}."
+                    )
+
+            if not self.model_config.disable_cascade_attn:
+                self.model_config.disable_cascade_attn = True
+                logger.warning_once("Disabling cascade attention when DBO is enabled.")
 
             if not self.model_config.disable_cascade_attn:
                 self.model_config.disable_cascade_attn = True
